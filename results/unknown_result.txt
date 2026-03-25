@@ -1,0 +1,474 @@
+Title: TESTING_NOT_REAL_ID_YET: binder: fix use-after-free in shinker's callback
+
+Introduced Version: 4.20
+
+Content:
+TESTING_NOT_REAL_ID_YET: binder: fix use-after-free in shinker's callback
+
+binder: fix use-after-free in shinker's callback
+
+The mmap read lock is used during the shrinker's callback, which means
+that using alloc->vma pointer isn't safe as it can race with munmap().
+As of commit dd2283f2605e ("mm: mmap: zap pages with read mmap_sem in
+munmap") the mmap lock is downgraded after the vma has been isolated.
+
+I was able to reproduce this issue by manually adding some delays and
+triggering page reclaiming through the shrinker's debug sysfs. The
+following KASAN report confirms the UAF:
+
+  ==================================================================
+  BUG: KASAN: slab-use-after-free in zap_page_range_single+0x470/0x4b8
+  Read of size 8 at addr ffff356ed50e50f0 by task bash/478
+
+  CPU: 1 PID: 478 Comm: bash Not tainted 6.6.0-rc5-00055-g1c8b86a3799f-dirty #70
+  Hardware name: linux,dummy-virt (DT)
+  Call trace:
+   zap_page_range_single+0x470/0x4b8
+   binder_alloc_free_page+0x608/0xadc
+   __list_lru_walk_one+0x130/0x3b0
+   list_lru_walk_node+0xc4/0x22c
+   binder_shrink_scan+0x108/0x1dc
+   shrinker_debugfs_scan_write+0x2b4/0x500
+   full_proxy_write+0xd4/0x140
+   vfs_write+0x1ac/0x758
+   ksys_write+0xf0/0x1dc
+   __arm64_sys_write+0x6c/0x9c
+
+  Allocated by task 492:
+   kmem_cache_alloc+0x130/0x368
+   vm_area_alloc+0x2c/0x190
+   mmap_region+0x258/0x18bc
+   do_mmap+0x694/0xa60
+   vm_mmap_pgoff+0x170/0x29c
+   ksys_mmap_pgoff+0x290/0x3a0
+   __arm64_sys_mmap+0xcc/0x144
+
+  Freed by task 491:
+   kmem_cache_free+0x17c/0x3c8
+   vm_area_free_rcu_cb+0x74/0x98
+   rcu_core+0xa38/0x26d4
+   rcu_core_si+0x10/0x1c
+   __do_softirq+0x2fc/0xd24
+
+  Last potentially related work creation:
+   __call_rcu_common.constprop.0+0x6c/0xba0
+   call_rcu+0x10/0x1c
+   vm_area_free+0x18/0x24
+   remove_vma+0xe4/0x118
+   do_vmi_align_munmap.isra.0+0x718/0xb5c
+   do_vmi_munmap+0xdc/0x1fc
+   __vm_munmap+0x10c/0x278
+   __arm64_sys_munmap+0x58/0x7c
+
+Fix this issue by performing instead a vma_lookup() which will fail to
+find the vma that was isolated before the mmap lock downgrade. Note that
+this option has better performance than upgrading to a mmap write lock
+which would increase contention. Plus, mmap_write_trylock() has been
+recently removed anyway.
+
+The Linux kernel CVE team has assigned TESTING_NOT_REAL_ID_YET to this issue.
+
+
+Affected and fixed versions
+===========================
+
+	Issue introduced in 4.20 with commit dd2283f2605e and fixed in 5.4.268 with commit a53e15e592b4
+	Issue introduced in 4.20 with commit dd2283f2605e and fixed in 5.10.209 with commit c8c1158ffb00
+	Issue introduced in 4.20 with commit dd2283f2605e and fixed in 5.15.148 with commit 8ad4d580e8af
+	Issue introduced in 4.20 with commit dd2283f2605e and fixed in 6.1.74 with commit 9fa04c93f241
+	Issue introduced in 4.20 with commit dd2283f2605e and fixed in 6.6.13 with commit a49087ab9350
+	Issue introduced in 4.20 with commit dd2283f2605e and fixed in 6.7.1 with commit e074686e993f
+	Issue introduced in 4.20 with commit dd2283f2605e and fixed in 6.8-rc1 with commit 3f489c2067c5
+
+Please see https://www.kernel.org or a full list of currently supported
+kernel versions by the kernel community.
+
+Unaffected versions might change over time as fixes are backported to
+older supported kernel versions.  The official CVE entry at
+	https://cve.org/CVERecord/?id=TESTING_NOT_REAL_ID_YET
+will be updated if fixes are backported, please check that for the most
+up to date information about this issue.
+
+
+Affected files
+==============
+
+The file(s) affected by this issue are:
+	drivers/android/binder_alloc.c
+
+
+Mitigation
+==========
+
+The Linux kernel CVE team recommends that you update to the latest
+stable kernel version for this, and many other bugfixes.  Individual
+changes are never tested alone, but rather are part of a larger kernel
+release.  Cherry-picking individual commits is not recommended or
+supported by the Linux kernel community at all.  If however, updating to
+the latest release is impossible, the individual changes to resolve this
+issue can be found at these commits:
+	https://git.kernel.org/stable/c/a53e15e592b4
+	https://git.kernel.org/stable/c/c8c1158ffb00
+	https://git.kernel.org/stable/c/8ad4d580e8af
+	https://git.kernel.org/stable/c/9fa04c93f241
+	https://git.kernel.org/stable/c/a49087ab9350
+	https://git.kernel.org/stable/c/e074686e993f
+	https://git.kernel.org/stable/c/3f489c2067c5
+
+Call Stacks:
+Stack 0:
+  zap_page_range_single
+  binder_alloc_free_page
+  __list_lru_walk_one
+  list_lru_walk_node
+  binder_shrink_scan
+  shrinker_debugfs_scan_write
+  full_proxy_write
+  vfs_write
+  ksys_write
+  __arm64_sys_write
+
+Functions:
+/* Call stack 0 */
+/* file: linux_src/linux-4.20/mm/memory.c */
+static void zap_page_range_single(struct vm_area_struct *vma, unsigned long address,
+		unsigned long size, struct zap_details *details)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	struct mmu_gather tlb;
+	unsigned long end = address + size;
+
+	lru_add_drain();
+	tlb_gather_mmu(&tlb, mm, address, end);
+	update_hiwater_rss(mm);
+	mmu_notifier_invalidate_range_start(mm, address, end);
+	unmap_single_vma(&tlb, vma, address, end, details);
+	mmu_notifier_invalidate_range_end(mm, address, end);
+	tlb_finish_mmu(&tlb, address, end);
+}
+/* file: linux_src/linux-4.20/drivers/android/binder_alloc.c */
+ * binder_alloc_free_page() - shrinker callback to free pages
+ * @item:   item to free
+ * @lock:   lock protecting the item
+ * @cb_arg: callback argument
+ *
+ * Called from list_lru_walk() in binder_shrink_scan() to free
+ * up pages when the system is under memory pressure.
+ */
+enum lru_status binder_alloc_free_page(struct list_head *item,
+				       struct list_lru_one *lru,
+				       spinlock_t *lock,
+				       void *cb_arg)
+{
+	struct mm_struct *mm = NULL;
+	struct binder_lru_page *page = container_of(item,
+						    struct binder_lru_page,
+						    lru);
+	struct binder_alloc *alloc;
+	uintptr_t page_addr;
+	size_t index;
+	struct vm_area_struct *vma;
+
+	alloc = page->alloc;
+	if (!mutex_trylock(&alloc->mutex))
+		goto err_get_alloc_mutex_failed;
+
+	if (!page->page_ptr)
+		goto err_page_already_freed;
+
+	index = page - alloc->pages;
+	page_addr = (uintptr_t)alloc->buffer + index * PAGE_SIZE;
+	vma = binder_alloc_get_vma(alloc);
+	if (vma) {
+		if (!mmget_not_zero(alloc->vma_vm_mm))
+			goto err_mmget;
+		mm = alloc->vma_vm_mm;
+		if (!down_write_trylock(&mm->mmap_sem))
+			goto err_down_write_mmap_sem_failed;
+	}
+
+	list_lru_isolate(lru, item);
+	spin_unlock(lock);
+
+	if (vma) {
+		trace_binder_unmap_user_start(alloc, index);
+
+		zap_page_range(vma,
+			       page_addr + alloc->user_buffer_offset,
+			       PAGE_SIZE);
+
+		trace_binder_unmap_user_end(alloc, index);
+
+		up_write(&mm->mmap_sem);
+		mmput(mm);
+	}
+
+	trace_binder_unmap_kernel_start(alloc, index);
+
+	unmap_kernel_range(page_addr, PAGE_SIZE);
+	__free_page(page->page_ptr);
+	page->page_ptr = NULL;
+
+	trace_binder_unmap_kernel_end(alloc, index);
+
+	spin_lock(lock);
+	mutex_unlock(&alloc->mutex);
+	return LRU_REMOVED_RETRY;
+
+err_down_write_mmap_sem_failed:
+	mmput_async(mm);
+err_mmget:
+err_page_already_freed:
+	mutex_unlock(&alloc->mutex);
+err_get_alloc_mutex_failed:
+	return LRU_SKIP;
+}
+/* file: linux_src/linux-4.20/mm/list_lru.c */
+__list_lru_walk_one(struct list_lru_node *nlru, int memcg_idx,
+		    list_lru_walk_cb isolate, void *cb_arg,
+		    unsigned long *nr_to_walk)
+{
+
+	struct list_lru_one *l;
+	struct list_head *item, *n;
+	unsigned long isolated = 0;
+
+	l = list_lru_from_memcg_idx(nlru, memcg_idx);
+restart:
+	list_for_each_safe(item, n, &l->list) {
+		enum lru_status ret;
+
+		/*
+		 * decrement nr_to_walk first so that we don't livelock if we
+		 * get stuck on large numbesr of LRU_RETRY items
+		 */
+		if (!*nr_to_walk)
+			break;
+		--*nr_to_walk;
+
+		ret = isolate(item, l, &nlru->lock, cb_arg);
+		switch (ret) {
+		case LRU_REMOVED_RETRY:
+			assert_spin_locked(&nlru->lock);
+			/* fall through */
+		case LRU_REMOVED:
+			isolated++;
+			nlru->nr_items--;
+			/*
+			 * If the lru lock has been dropped, our list
+			 * traversal is now invalid and so we have to
+			 * restart from scratch.
+			 */
+			if (ret == LRU_REMOVED_RETRY)
+				goto restart;
+			break;
+		case LRU_ROTATE:
+			list_move_tail(item, &l->list);
+			break;
+		case LRU_SKIP:
+			break;
+		case LRU_RETRY:
+			/*
+			 * The lru lock has been dropped, our list traversal is
+			 * now invalid and so we have to restart from scratch.
+			 */
+			assert_spin_locked(&nlru->lock);
+			goto restart;
+		default:
+			BUG();
+		}
+	}
+	return isolated;
+}
+/* file: linux_src/linux-4.20/mm/list_lru.c */
+unsigned long list_lru_walk_node(struct list_lru *lru, int nid,
+				 list_lru_walk_cb isolate, void *cb_arg,
+				 unsigned long *nr_to_walk)
+{
+	long isolated = 0;
+	int memcg_idx;
+
+	isolated += list_lru_walk_one(lru, nid, NULL, isolate, cb_arg,
+				      nr_to_walk);
+	if (*nr_to_walk > 0 && list_lru_memcg_aware(lru)) {
+		for_each_memcg_cache_index(memcg_idx) {
+			struct list_lru_node *nlru = &lru->node[nid];
+
+			spin_lock(&nlru->lock);
+			isolated += __list_lru_walk_one(nlru, memcg_idx,
+							isolate, cb_arg,
+							nr_to_walk);
+			spin_unlock(&nlru->lock);
+
+			if (*nr_to_walk <= 0)
+				break;
+		}
+	}
+	return isolated;
+}
+/* file: linux_src/linux-4.20/drivers/android/binder_alloc.c */
+ * Called from list_lru_walk() in binder_shrink_scan() to free
+ * up pages when the system is under memory pressure.
+ */
+enum lru_status binder_alloc_free_page(struct list_head *item,
+				       struct list_lru_one *lru,
+				       spinlock_t *lock,
+				       void *cb_arg)
+{
+	struct mm_struct *mm = NULL;
+	struct binder_lru_page *page = container_of(item,
+						    struct binder_lru_page,
+						    lru);
+	struct binder_alloc *alloc;
+	uintptr_t page_addr;
+	size_t index;
+	struct vm_area_struct *vma;
+
+	alloc = page->alloc;
+	if (!mutex_trylock(&alloc->mutex))
+		goto err_get_alloc_mutex_failed;
+
+	if (!page->page_ptr)
+		goto err_page_already_freed;
+
+	index = page - alloc->pages;
+	page_addr = (uintptr_t)alloc->buffer + index * PAGE_SIZE;
+	vma = binder_alloc_get_vma(alloc);
+	if (vma) {
+		if (!mmget_not_zero(alloc->vma_vm_mm))
+			goto err_mmget;
+		mm = alloc->vma_vm_mm;
+		if (!down_write_trylock(&mm->mmap_sem))
+			goto err_down_write_mmap_sem_failed;
+	}
+
+	list_lru_isolate(lru, item);
+	spin_unlock(lock);
+
+	if (vma) {
+		trace_binder_unmap_user_start(alloc, index);
+
+		zap_page_range(vma,
+			       page_addr + alloc->user_buffer_offset,
+			       PAGE_SIZE);
+
+		trace_binder_unmap_user_end(alloc, index);
+
+		up_write(&mm->mmap_sem);
+		mmput(mm);
+	}
+
+	trace_binder_unmap_kernel_start(alloc, index);
+
+	unmap_kernel_range(page_addr, PAGE_SIZE);
+	__free_page(page->page_ptr);
+	page->page_ptr = NULL;
+
+	trace_binder_unmap_kernel_end(alloc, index);
+
+	spin_lock(lock);
+	mutex_unlock(&alloc->mutex);
+	return LRU_REMOVED_RETRY;
+
+err_down_write_mmap_sem_failed:
+	mmput_async(mm);
+err_mmget:
+err_page_already_freed:
+	mutex_unlock(&alloc->mutex);
+err_get_alloc_mutex_failed:
+	return LRU_SKIP;
+}
+/* file: linux_src/linux-4.20/kernel/sysctl_binary.c */
+		result = vfs_write(file, newval, newlen, &pos);
+		if (result < 0)
+			goto out;
+	}
+
+	result = copied;
+out:
+	return result;
+}
+
+static ssize_t bin_intvec(struct file *file,
+	void __user *oldval, size_t oldlen, void __user *newval, size_t newlen)
+{
+	ssize_t copied = 0;
+	char *buffer;
+	ssize_t result;
+
+	result = -ENOMEM;
+	buffer = kmalloc(BUFSZ, GFP_KERNEL);
+	if (!buffer)
+		goto out;
+
+	if (oldval && oldlen) {
+		unsigned __user *vec = oldval;
+		size_t length = oldlen / sizeof(*vec);
+		char *str, *end;
+		int i;
+		loff_t pos = 0;
+
+		result = kernel_read(file, buffer, BUFSZ - 1, &pos);
+		if (result < 0)
+			goto out_kfree;
+
+		str = buffer;
+		end = str + result;
+		*end++ = '\0';
+		for (i = 0; i < length; i++) {
+			unsigned long value;
+
+			value = simple_strtoul(str, &str, 10);
+			while (isspace(*str))
+				str++;
+			
+			result = -EFAULT;
+			if (put_user(value, vec + i))
+				goto out_kfree;
+
+			copied += sizeof(*vec);
+			if (!isdigit(*str))
+				break;
+		}
+	}
+
+	if (newval && newlen) {
+		unsigned __user *vec = newval;
+		size_t length = newlen / sizeof(*vec);
+		char *str, *end;
+		int i;
+		loff_t pos = 0;
+
+		str = buffer;
+		end = str + BUFSZ;
+		for (i = 0; i < length; i++) {
+			unsigned long value;
+
+			result = -EFAULT;
+			if (get_user(value, vec + i))
+				goto out_kfree;
+
+			str += scnprintf(str, end - str, "%lu\t", value);
+		}
+
+		result = kernel_write(file, buffer, str - buffer, &pos);
+		if (result < 0)
+			goto out_kfree;
+	}
+	result = copied;
+out_kfree:
+	kfree(buffer);
+out:
+	return result;
+}
+/* file: linux_src/linux-4.20/init/do_mounts_rd.c */
+		ksys_write(out_fd, buf, BLOCK_SIZE);
+#if !defined(CONFIG_S390)
+		if (!(i % 16)) {
+			pr_cont("%c\b", rotator[rotate & 0x3]);
+			rotate++;
+		}
+
+Conflicting Resources:
+  mmap_sem (mm->mmap_sem)
+  vma (vm_area_struct)
